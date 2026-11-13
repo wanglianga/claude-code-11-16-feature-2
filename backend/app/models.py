@@ -54,6 +54,52 @@ TASK_RESOLVED = "resolved"
 CONFLICT_OPEN = "open"
 CONFLICT_RESOLVED = "resolved"
 
+# ---- 站内差额定位：拓扑与残差 ----
+TOPO_ACTIVE = "active"
+TOPO_SUPERSEDED = "superseded"
+
+# 连接关系校验问题的类别
+TOPO_ISSUE_CYCLE = "cycle"                      # 连接图有环
+TOPO_ISSUE_DUPLICATE_MOUNT = "duplicate_mount"  # 同一设备在同一时段重复挂接
+TOPO_ISSUE_COVERAGE = "coverage_mismatch"       # 父子读数覆盖时段不一致
+TOPO_ISSUE_PARENT_CHAIN = "parent_inconsistent" # 节点记录与连接关系声明的上级不一致
+
+TOPO_ISSUE_OPEN = "open"
+TOPO_ISSUE_CLEARED = "cleared"
+
+# 支路残差：父节点电量减已知下级电量后的差额归属
+RESIDUAL_TOP = "top_residual"           # 总表层扣除支路与未覆盖负荷后仍未解释的盲区
+RESIDUAL_BRANCH = "branch_residual"     # 落在某个支路上，需继续定位
+RESIDUAL_UNCOVERED = "uncovered_load"   # 落在未纳入连接的公共负荷/计量盲区，单列
+RESIDUAL_ZERO = "zero"                  # 无残差
+RESIDUAL_INVALID = "invalid_topology"   # 拓扑校验未通过，计算停止
+
+# 缺报标记：该支路（设备）在该时窗内没有可用订单依据
+GAP_ORDER = "order_gap"           # 完全缺订单
+GAP_READING = "reading_gap"       # 订单有、设备读数缺
+GAP_PARTIAL = "partial_coverage"  # 订单时段未覆盖整层计量区间
+
+# 现场复核案件
+CASE_OPEN = "open"
+CASE_IN_PROGRESS = "in_progress"
+CASE_EVIDENCE_SUBMITTED = "evidence_submitted"
+CASE_CLOSED = "closed"          # 证据已提交，后续由财务独立判断采纳
+CASE_SUPERSEDED = "superseded"  # 补报数据后重算，旧结论失效
+
+# 现场证据类型
+EVIDENCE_REPAIR = "repair"            # 检修记录
+EVIDENCE_PUBLIC_LOAD = "public_load"  # 未覆盖公共负荷
+EVIDENCE_METER_ERROR = "meter_error"  # 计量错误
+
+# 财务采纳结论
+ADOPTION_ADOPTED = "adopted"      # 可用于结算
+ADOPTION_PENDING = "pending"      # 待财务判断
+ADOPTION_REJECTED = "rejected"    # 不采纳，不得减少应付费用
+
+RESIDUAL_JOB_RUNNING = "running"
+RESIDUAL_JOB_COMPLETED = "completed"
+RESIDUAL_JOB_BLOCKED = "blocked"  # 拓扑校验未通过，残差计算停止
+
 
 class Site(Base):
     __tablename__ = "sites"
@@ -91,7 +137,7 @@ class Meter(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
     meter_no: Mapped[str] = mapped_column(String(64))
-    meter_kind: Mapped[str] = mapped_column(String(16))  # master=物业总表 / device=设备表
+    meter_kind: Mapped[str] = mapped_column(String(16))  # master=物业总表 / branch=配电支路 / device=设备表
     device_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     is_cumulative: Mapped[bool] = mapped_column(Boolean, default=True)  # 累计/增量
     __table_args__ = (UniqueConstraint("site_id", "meter_no"),)
@@ -366,6 +412,10 @@ class BillAdjustment(Base):
     corrected_value: Mapped[Decimal] = mapped_column(Numeric(14, 4))
     delta: Mapped[Decimal] = mapped_column(Numeric(14, 4))
     reason: Mapped[str] = mapped_column(Text)
+    # 与现场复核的相互引用：说明 -> 残差 -> 财务采纳 -> 账单更正
+    case_id: Mapped[int | None] = mapped_column(ForeignKey("field_review_cases.id"), nullable=True)
+    residual_id: Mapped[int | None] = mapped_column(ForeignKey("branch_residuals.id"), nullable=True)
+    adoption_id: Mapped[int | None] = mapped_column(ForeignKey("finance_adoptions.id"), nullable=True)
     created_by: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     bill: Mapped[Bill] = relationship(back_populates="adjustments")
@@ -401,4 +451,189 @@ class ReviewTask(Base):
     response: Mapped[str | None] = mapped_column(Text, nullable=True)
     responded_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     responded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# ================= 站内计量差额定位与现场复核 =================
+#
+# 层次：总表(master) -> 配电支路(branch) -> 设备表(device)。
+# 连接关系按生效时间存版本；同一时段内「上级电量 - 已知下级电量」逐层计算残差，
+# 残差只用于缩小可疑范围，不定性为设备故障。
+
+class TopologyEdge(Base):
+    """一条有效连接关系：上级节点供电给下级节点，自 effective_ts 起生效。"""
+    __tablename__ = "topology_edges"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    parent_meter_id: Mapped[int] = mapped_column(ForeignKey("meters.id"), index=True)
+    child_meter_id: Mapped[int] = mapped_column(ForeignKey("meters.id"), index=True)
+    parent_role: Mapped[str] = mapped_column(String(16))  # master / branch
+    child_role: Mapped[str] = mapped_column(String(16))   # branch / device
+    device_id: Mapped[str | None] = mapped_column(String(64), nullable=True)  # 子节点为设备时
+    effective_ts: Mapped[datetime] = mapped_column(DateTime)   # UTC
+    effective_ts_local: Mapped[datetime] = mapped_column(DateTime)
+    end_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # 改线后旧关系的终止时间
+    evidence_note: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default=TOPO_ACTIVE)
+    source_record_id: Mapped[int | None] = mapped_column(ForeignKey("source_records.id"), nullable=True)
+    revision_id: Mapped[int | None] = mapped_column(ForeignKey("record_revisions.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __table_args__ = (Index("ix_topo_edge_site_eff", "site_id", "effective_ts"),)
+
+
+class TopologyIssue(Base):
+    """拓扑校验问题：环、重复挂接、覆盖不一致。计算遇到未清除问题即停止并指出对象。"""
+    __tablename__ = "topology_issues"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    issue_kind: Mapped[str] = mapped_column(String(24))
+    subject: Mapped[str] = mapped_column(String(255))  # 涉及的表号/边 id，便于直接指出对象
+    detail: Mapped[str] = mapped_column(Text)
+    detected_at_local: Mapped[datetime] = mapped_column(DateTime)
+    detected_at_ts: Mapped[datetime] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(16), default=TOPO_ISSUE_OPEN)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class JobTopologySnapshot(Base):
+    """作业冻结的连接关系版本：关系变更与核算同时发生时保留原输入。"""
+    __tablename__ = "job_topology_snapshots"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_jobs.id"), index=True)
+    edge_id: Mapped[int] = mapped_column(ForeignKey("topology_edges.id"))
+    parent_meter_no: Mapped[str] = mapped_column(String(64))
+    child_meter_no: Mapped[str] = mapped_column(String(64))
+    parent_role: Mapped[str] = mapped_column(String(16))
+    child_role: Mapped[str] = mapped_column(String(16))
+    device_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    effective_ts: Mapped[datetime] = mapped_column(DateTime)
+    end_ts: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    evidence_note: Mapped[str] = mapped_column(Text, default="")
+    __table_args__ = (UniqueConstraint("job_id", "edge_id"),)
+
+
+class JobResidualSummary(Base):
+    """站级差额定位结论：差额集中支路 / 缺报时段 / 未覆盖负荷分列，供运维判断。"""
+    __tablename__ = "job_residual_summaries"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_jobs.id"), unique=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16), default=RESIDUAL_JOB_RUNNING)
+    master_total_kwh: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    known_children_kwh: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    branch_residual_kwh: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    uncovered_kwh: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    top_residual_kwh: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    order_gap_kwh: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    gap_windows: Mapped[str | None] = mapped_column(Text, nullable=True)
+    concentrated_branches: Mapped[str | None] = mapped_column(Text, nullable=True)
+    conclusion: Mapped[str] = mapped_column(Text, default="")
+    blocked_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    copied_from_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class BranchResidual(Base):
+    """一层一档：某上级节点在其计量区间内，扣掉已知下级电量后的残差。"""
+    __tablename__ = "branch_residuals"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_jobs.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    parent_meter_no: Mapped[str] = mapped_column(String(64))
+    parent_role: Mapped[str] = mapped_column(String(16))
+    subject: Mapped[str] = mapped_column(String(255), default="")  # 展示对象：支路/负荷/盲区
+    start_ts: Mapped[datetime] = mapped_column(DateTime)
+    end_ts: Mapped[datetime] = mapped_column(DateTime)
+    start_ts_local: Mapped[datetime] = mapped_column(DateTime)
+    end_ts_local: Mapped[datetime] = mapped_column(DateTime)
+    parent_kwh: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    known_children_kwh: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    residual_kwh: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    residual_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+    order_gap_kwh: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    uncovered_kwh: Mapped[Decimal] = mapped_column(Numeric(14, 4), default=Decimal("0"))
+    unexplained_kwh: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    residual_kind: Mapped[str] = mapped_column(String(20), default=RESIDUAL_BRANCH)
+    has_order_gap: Mapped[bool] = mapped_column(Boolean, default=False)
+    has_reading_gap: Mapped[bool] = mapped_column(Boolean, default=False)
+    suspect: Mapped[bool] = mapped_column(Boolean, default=False)  # 读数齐全仍持续偏离，才进入现场复核
+    continues_previous: Mapped[bool] = mapped_column(Boolean, default=False)  # 与上一个时窗同向偏离
+    case_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 生成/关联的现场复核工单
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class OrderGap(Base):
+    """缺报区间：某设备在某时窗内订单覆盖不足，先追数据。"""
+    __tablename__ = "order_gaps"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_jobs.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    meter_no: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    device_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    start_ts: Mapped[datetime] = mapped_column(DateTime)
+    end_ts: Mapped[datetime] = mapped_column(DateTime)
+    start_ts_local: Mapped[datetime] = mapped_column(DateTime)
+    end_ts_local: Mapped[datetime] = mapped_column(DateTime)
+    gap_kind: Mapped[str] = mapped_column(String(24))
+    missing_kwh: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    covered_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    total_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class FieldReviewCase(Base):
+    """现场复核工单：只对读数齐全仍持续偏离的支路开启；改线/补报后旧结论失效。"""
+    __tablename__ = "field_review_cases"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_jobs.id"), index=True)
+    residual_id: Mapped[int | None] = mapped_column(ForeignKey("branch_residuals.id"), nullable=True)
+    meter_no: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    device_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    branch_path: Mapped[str] = mapped_column(String(255))
+    start_ts: Mapped[datetime] = mapped_column(DateTime)
+    end_ts: Mapped[datetime] = mapped_column(DateTime)
+    start_ts_local: Mapped[datetime] = mapped_column(DateTime)
+    end_ts_local: Mapped[datetime] = mapped_column(DateTime)
+    residual_kwh: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    reason: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default=CASE_OPEN)
+    assignee: Mapped[str] = mapped_column(String(16), default=ROLE_OPERATOR)
+    handling_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    handled_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    superseded_by_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    superseded_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class CaseEvidence(Base):
+    """现场说明：检修 / 未覆盖公共负荷 / 计量错误。与残差、采纳记录相互引用。"""
+    __tablename__ = "case_evidence"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("field_review_cases.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    evidence_kind: Mapped[str] = mapped_column(String(24))
+    claim_kwh: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    description: Mapped[str] = mapped_column(Text)
+    attachment_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)  # 工单号/照片编号等
+    submitted_by: Mapped[str] = mapped_column(String(64))
+    submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    would_reduce_payable: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class FinanceAdoption(Base):
+    """财务独立判断哪些现场说明可用于结算；未采纳说明不得减少应付费用。"""
+    __tablename__ = "finance_adoptions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("field_review_cases.id"), index=True)
+    evidence_id: Mapped[int] = mapped_column(ForeignKey("case_evidence.id"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("sites.id"), index=True)
+    bill_id: Mapped[int | None] = mapped_column(ForeignKey("bills.id"), nullable=True)
+    decision: Mapped[str] = mapped_column(String(16), default=ADOPTION_PENDING)
+    adopted_kwh: Mapped[Decimal | None] = mapped_column(Numeric(14, 4), nullable=True)
+    allowed_to_reduce_payable: Mapped[bool] = mapped_column(Boolean, default=False)
+    reason: Mapped[str] = mapped_column(Text)
+    decided_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

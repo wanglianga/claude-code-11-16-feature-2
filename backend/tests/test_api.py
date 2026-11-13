@@ -1,5 +1,6 @@
 """API 端到端：登录、角色权限、物业站点隔离、账单确认前检查、差额更正、下钻。"""
 from datetime import datetime
+from decimal import Decimal
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -27,7 +28,7 @@ def test_login_and_wrong_password():
                        json={"username": "finance", "password": "bad"}).status_code == 401
     token = _login("finance", "Finance@123")
     r = client.get("/api/sites", headers=_auth(token))
-    assert r.status_code == 200 and len(r.json()) == 2
+    assert r.status_code == 200 and len(r.json()) == 3
 
 
 def _seed_jobs():
@@ -95,6 +96,7 @@ def test_bill_confirm_precheck_block_and_adjustment_keeps_original():
         bill = db.scalar(select(models.Bill).where(models.Bill.job_id == job.id))
         bill_id = bill.id
         original_unexplained = bill.unexplained_kwh
+        original_public = bill.public_kwh
         site2 = db.scalar(select(models.Site).where(models.Site.code == "S02"))
         job2 = run_reconciliation(db, site2, datetime(2026, 10, 1), datetime(2026, 11, 1), "tester")
         db.commit()
@@ -115,16 +117,23 @@ def test_bill_confirm_precheck_block_and_adjustment_keeps_original():
     # 重复确认被拒
     assert client.post(f"/api/bills/{bill_id}/confirm", headers=fin).status_code == 409
 
-    # 已确认账单只能差额更正，原值保留
+    # 已确认账单只能差额更正，原值保留；减少应付费用必须引用财务采纳（未引用则拒绝）
     r = client.post(f"/api/bills/{bill_id}/adjustments", headers=fin, json={
         "component": "unexplained_kwh",
         "corrected_value": "25.0000",
         "reason": "物业补充线损依据，财务复核后登记差额更正",
     })
+    assert r.status_code == 409 and "采纳" in r.json()["detail"]
+    r = client.post(f"/api/bills/{bill_id}/adjustments", headers=fin, json={
+        "component": "public_kwh",
+        "corrected_value": "330.0000",
+        "reason": "补充公共负荷读数依据，财务复核后上调",
+    })
     assert r.status_code == 200
     adj = r.json()
-    assert adj["original_value"] == str(original_unexplained)
-    assert adj["delta"] == str(25 - float(original_unexplained))
+    assert adj["original_value"] == str(original_public)
+    assert adj["delta"] == str((Decimal("330") - original_public).quantize(Decimal("0.0001")))
+    assert adj["adoption_id"] is None
     db = SessionLocal()
     try:
         bill = db.get(models.Bill, bill_id)
@@ -194,3 +203,106 @@ def test_operator_resolves_conflict():
     r2 = client.post(f"/api/conflicts/{c['id']}/resolve", headers=prop, json={
         "resolved_order_id": c["order_a_id"], "resolution_note": "x"})
     assert r2.status_code == 403
+
+
+def test_topology_and_field_case_flow():
+    """拓扑登记/预检/残差下钻/现场说明/财务采纳 API 全链路与权限。"""
+    import csv
+    import io
+
+    fin = _auth(_login("finance", "Finance@123"))
+    op = _auth(_login("operator", "Operator@123"))
+    prop = _auth(_login("property_hz", "Property@123"))
+    site3 = client.get("/api/sites", headers=fin).json()
+    site3_id = next(s["id"] for s in site3 if s["code"] == "S03")
+
+    edges = client.get(f"/api/topology/edges?site_id={site3_id}", headers=fin).json()
+    assert len(edges) == 8
+    assert any(e["child_meter_no"] == "BR-1" and e["parent_meter_no"] == "M-HZ-01"
+               for e in edges)
+
+    check = client.get(
+        "/api/topology/check", headers=op,
+        params={"site_id": site3_id, "cycle_start": "2026-10-01T00:00:00",
+                "cycle_end": "2026-11-01T00:00:00"},
+    ).json()
+    assert check["issues"] == []
+
+    # 发起 S03 核算后下钻残差与缺报
+    job = client.post("/api/jobs", headers=fin, json={
+        "site_id": site3_id,
+        "cycle_start": "2026-10-01T00:00:00",
+        "cycle_end": "2026-11-01T00:00:00",
+    }).json()
+    summary = client.get(f"/api/jobs/{job['id']}/residual-summary", headers=fin).json()
+    assert summary["status"] == "completed"
+    assert "BR-3" in summary["concentrated_branches"]
+    residuals = client.get(f"/api/jobs/{job['id']}/residuals", headers=fin).json()
+    assert any(r["suspect"] for r in residuals)
+    gaps = client.get(f"/api/jobs/{job['id']}/order-gaps", headers=fin).json()
+    assert [g["device_id"] for g in gaps] == ["DEV-H3"]
+
+    cases = client.get(f"/api/field-cases?site_id={site3_id}", headers=op).json()
+    assert len(cases) == 1 and cases[0]["meter_no"] == "BR-3"
+    case_id = cases[0]["id"]
+
+    # 现场人员提交检修说明
+    ev = client.post(f"/api/field-cases/{case_id}/evidence", headers=op, json={
+        "evidence_kind": "repair",
+        "claim_kwh": "60",
+        "description": "现场检修 BR-3 出线端子并复测，60 kWh 可能为接触不良损耗。",
+        "attachment_ref": "WO-HZ-20261026-11",
+    })
+    assert ev.status_code == 200, ev.text
+    evidence_id = ev.json()["id"]
+
+    # 财务未采纳前：采纳接口只有财务可调用，物业/运营无权
+    r = client.post(f"/api/field-cases/evidence/{evidence_id}/adoption", headers=op, json={
+        "decision": "adopted", "adopted_kwh": "60", "reason": "同意"})
+    assert r.status_code == 403
+
+    pending = client.post(f"/api/field-cases/evidence/{evidence_id}/adoption", headers=fin, json={
+        "decision": "pending", "reason": "缺少复测原始记录，暂不采纳"})
+    assert pending.status_code == 200
+    assert pending.json()["allowed_to_reduce_payable"] is False
+
+    bill = client.get(f"/api/bills?site_id={site3_id}", headers=fin).json()[0]
+    assert bill["status"] == "draft"
+    confirmed = client.post(f"/api/bills/{bill['id']}/confirm", headers=fin)
+    assert confirmed.status_code == 200
+
+    # 未采纳说明：减费更正被拒
+    r = client.post(f"/api/bills/{bill['id']}/adjustments", headers=fin, json={
+        "component": "unexplained_kwh",
+        "corrected_value": str(float(bill["unexplained_kwh"]) - 60),
+        "reason": "按检修说明减费",
+    })
+    assert r.status_code == 409 and "采纳" in r.json()["detail"]
+
+    # 财务采纳 40 kWh 后，引用采纳记录可减费；但不得超过采纳电量
+    adoption = client.post(f"/api/field-cases/evidence/{evidence_id}/adoption", headers=fin, json={
+        "decision": "adopted", "adopted_kwh": "40", "bill_id": bill["id"],
+        "reason": "复测支持 40 kWh 为计量错误，予以采纳"})
+    assert adoption.status_code == 200
+    adoption_id = adoption.json()["id"]
+    view = client.get(f"/api/field-cases/{case_id}", headers=fin).json()
+    assert any(item["adoption"] and item["adoption"]["id"] == adoption_id
+               for item in view["evidence"])
+    assert view["adopted_reduction_kwh"] == "40.0000"
+
+    r = client.post(f"/api/bills/{bill['id']}/adjustments", headers=fin, json={
+        "component": "unexplained_kwh",
+        "corrected_value": str(float(bill["unexplained_kwh"]) - 40),
+        "reason": "引用已采纳说明",
+        "adoption_id": adoption_id,
+    })
+    assert r.status_code == 200, r.text
+    assert r.json()["adoption_id"] == adoption_id
+    assert r.json()["case_id"] == case_id
+
+    # 新链接关系：上级角色非法被拒；物业不能登记连接关系
+    r = client.post(f"/api/topology/edges?site_id={site3_id}", headers=prop, json={
+        "parent_meter_no": "M-HZ-01", "child_meter_no": "BR-9",
+        "parent_role": "master", "child_role": "branch",
+        "effective_time": "2026-10-01T00:00:00"})
+    assert r.status_code == 403

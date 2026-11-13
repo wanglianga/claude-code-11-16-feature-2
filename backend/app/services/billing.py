@@ -69,8 +69,12 @@ def add_adjustment(
     corrected_value,
     reason: str,
     user: models.User,
+    adoption_id: int | None = None,
 ) -> models.BillAdjustment:
-    """已确认账单只允许差额更正：保留原值，以更正行体现 delta，不直接替换原字段。"""
+    """已确认账单只允许差额更正：保留原值，以更正行体现 delta，不直接替换原字段。
+
+    减少应付费用的更正必须引用财务已采纳的现场说明；未采纳的说明不得直接减费。
+    """
     if bill.status not in (models.BILL_CONFIRMED, models.BILL_ADJUSTED):
         raise HTTPException(status.HTTP_409_CONFLICT, "只有已确认账单可以登记差额更正")
     field_map = {
@@ -85,16 +89,54 @@ def add_adjustment(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"未知更正成分 {component}")
     original = field_map[component]
     corrected = quantize(corrected_value, 4)
+    delta = quantize(corrected - original, 4)
+
+    adoption = None
+    if adoption_id is not None:
+        adoption = db.get(models.FinanceAdoption, adoption_id)
+        if adoption is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "引用的财务采纳记录不存在")
+        if adoption.site_id != bill.site_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "采纳记录与账单不在同一站点")
+        if adoption.bill_id is not None and adoption.bill_id != bill.id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "该采纳记录已绑定其他账单")
+        if not adoption.allowed_to_reduce_payable:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "引用的现场说明未被财务采纳，不能用于减少应付费用",
+            )
+        adoption.bill_id = bill.id
+
+    if delta < 0 and adoption is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "减少应付费用的更正必须引用财务已采纳的现场说明（adoption_id）",
+        )
+    if adoption is not None and delta < 0:
+        adoptable = abs(adoption.adopted_kwh or 0)
+        if abs(delta) > adoptable:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"更正减少量超出该说明被采纳的电量（{adoptable}），不能多减",
+            )
+
     adj = models.BillAdjustment(
         bill_id=bill.id,
         source_job_id=bill.job_id,
         component=component,
         original_value=original,
         corrected_value=corrected,
-        delta=quantize(corrected - original, 4),
+        delta=delta,
         reason=reason,
+        case_id=adoption.case_id if adoption else None,
+        residual_id=None,
+        adoption_id=adoption.id if adoption else None,
         created_by=user.username,
     )
+    if adoption is not None and adoption.case_id:
+        case = db.get(models.FieldReviewCase, adoption.case_id)
+        if case is not None and case.residual_id:
+            adj.residual_id = case.residual_id
     db.add(adj)
     bill.status = models.BILL_ADJUSTED
     db.flush()

@@ -363,6 +363,11 @@ def run_reconciliation(
                                    entity_id=rep.id, revision_id=None))
     db.flush()
 
+    # ---- 1.5 冻结连接关系（拓扑）：现场改线后按生效时间分段，重跑沿用原快照 ----
+    from .topology import snapshot_topology  # 延迟导入：topology 复用本模块的读数分段函数
+
+    snapshot_topology(db, site, job, source_job)
+
     # ---- 2. 总表计量区间 ----
     master_meters = db.scalars(
         select(models.Meter).where(
@@ -495,6 +500,7 @@ def run_reconciliation(
     has_suspended_interval = False
     unconfirmed_public_tasked: set[int] = set()
     intervals_out: list[models.ReconciliationInterval] = []
+    residual_inputs: list[dict] = []
 
     for mm, span, prev_read, cur_read in master_intervals:
         t1, t2 = span.start, span.end
@@ -593,6 +599,10 @@ def run_reconciliation(
         unexplained = quantize(master_energy - device_energy - public_energy, Q4)
         rec.unexplained_kwh = unexplained
         bill_unexplained += unexplained
+        residual_inputs.append({
+            "meter_no": mm.meter_no,
+            "t1": t1, "t2": t2, "energy": master_energy,
+        })
 
         if interval_suspended:
             rec.basis_status = models.BASIS_SUSPENDED
@@ -606,6 +616,16 @@ def run_reconciliation(
         intervals_out.append(rec)
 
     db.flush()
+
+    # ---- 5.5 站内差额定位：逐层残差 / 缺报窗口 / 现场复核工单 ----
+    # 残差只缩小可疑范围，不改写账单未解释差额，也不把差额定性为设备故障。
+    from .topology import analyze_job
+
+    analyze_job(
+        db, job, site, adopted_readings, adopted_orders, adopted_public,
+        residual_inputs, start_utc, end_utc, tasks,
+        supersede_prior=source_job is None,
+    )
 
     # ---- 6. 订单拆分段落库（关联所在区间） ----
     for order in valid_orders:

@@ -17,6 +17,7 @@ USERS = [
     ("operator", "Operator@123", "运营专员", models.ROLE_OPERATOR, []),
     ("property_sh", "Property@123", "上海物业", models.ROLE_PROPERTY, ["S01"]),
     ("property_xj", "Property@123", "乌鲁木齐物业", models.ROLE_PROPERTY, ["S02"]),
+    ("property_hz", "Property@123", "杭州物业", models.ROLE_PROPERTY, ["S03"]),
 ]
 
 IMPORT_PLAN = {
@@ -36,6 +37,16 @@ IMPORT_PLAN = {
         ("public_load", "public_loads.csv"),
         ("order", "orders.csv"),
     ],
+    # 先导入读数与连接关系，再导入订单；拓扑需在两轮核算之间可修订
+    "S03": [
+        ("tariff", "tariffs.csv"),
+        ("master_reading", "master_readings.csv"),
+        ("branch_reading", "branch_readings.csv"),
+        ("device_reading", "device_readings.csv"),
+        ("topology", "topology.csv"),
+        ("public_load", "public_loads.csv"),
+        ("order", "orders.csv"),
+    ],
 }
 
 
@@ -51,6 +62,10 @@ def init_db():
                                diff_threshold_pct=Decimal("0.02")),
             "S02": models.Site(code="S02", name="乌鲁木齐经开充电站", timezone="Asia/Urumqi",
                                diff_threshold_pct=Decimal("0.02")),
+            # S03 站级阈值 5%：支路差额可进入现场复核，账单本身仍可确认，
+            # 便于演示“财务采纳后才可减少应付费用”的闭环。
+            "S03": models.Site(code="S03", name="杭州临平充电站", timezone="Asia/Shanghai",
+                               diff_threshold_pct=Decimal("0.05")),
         }
         db.add_all(sites.values())
         db.flush()

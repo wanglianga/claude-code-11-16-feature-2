@@ -95,3 +95,5 @@ pre.raw { background: #0f1e3d; color: #cfe0ff; padding: 10px; border-radius: 8px
 .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
 .tabs button { background: #e8edf7; color: var(--text); }
 .tabs button.active { background: var(--primary); color: #fff; }
+
+.danger-text { color: var(--danger); font-weight: 600; }

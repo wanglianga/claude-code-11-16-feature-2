@@ -12,6 +12,7 @@ from .routers import (
     sites,
     source_records,
     tasks,
+    topology,
 )
 
 app = FastAPI(
@@ -42,5 +43,6 @@ def health():
 for r in (
     auth.router, sites.router, imports.router, jobs.router, bills.router,
     tasks.router, conflicts.router, source_records.router, entities.router,
+    topology.router,
 ):
     app.include_router(r)

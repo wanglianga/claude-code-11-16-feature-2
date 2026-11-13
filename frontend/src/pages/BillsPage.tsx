@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, errText } from "../api";
 import { useAuth } from "../auth";
-import type { Bill, Interval, Split, Adjustment, Site } from "../types";
+import type { Bill, Interval, Split, Adjustment, Site, FieldCase, Adoption } from "../types";
 
 const STATUS_LABEL: Record<string, string> = {
   draft: "待确认", suspended: "挂起", confirmed: "已确认", adjusted: "已更正",
@@ -16,6 +16,7 @@ export default function BillsPage() {
   const [intervals, setIntervals] = useState<Interval[]>([]);
   const [splits, setSplits] = useState<Split[]>([]);
   const [adjustments, setAdjustments] = useState<Adjustment[]>([]);
+  const [adoptable, setAdoptable] = useState<{ adoption: Adoption; casePath: string }[]>([]);
   const [precheck, setPrecheck] = useState<Record<string, unknown> | null>(null);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
@@ -32,13 +33,26 @@ export default function BillsPage() {
   const drill = async (bill: Bill) => {
     setOpenBill(bill);
     setMsg(""); setErr(""); setPrecheck(null);
-    const [iv, sp, adj, pre] = await Promise.all([
+    const [iv, sp, adj, pre, cases] = await Promise.all([
       api.get<Interval[]>(`/api/jobs/${bill.job_id}/intervals`),
       api.get<Split[]>(`/api/jobs/${bill.job_id}/splits`),
       api.get<Adjustment[]>(`/api/bills/${bill.id}/adjustments`),
       api.get(`/api/bills/${bill.id}/precheck`),
+      api.get<FieldCase[]>("/api/field-cases", { params: { site_id: bill.site_id } }),
     ]);
     setIntervals(iv.data); setSplits(sp.data); setAdjustments(adj.data); setPrecheck(pre.data);
+    // 仅列出财务已采纳且允许减少应付费用的现场说明
+    const links: { adoption: Adoption; casePath: string }[] = [];
+    for (const c of cases.data) {
+      const detail = (await api.get(`/api/field-cases/${c.id}`)).data;
+      for (const item of detail.evidence as { evidence: { id: number }; adoption: Adoption | null }[]) {
+        const a = item.adoption;
+        if (a && a.decision === "adopted" && a.allowed_to_reduce_payable) {
+          links.push({ adoption: a, casePath: `${c.branch_path} · ${item.evidence.id}` });
+        }
+      }
+    }
+    setAdoptable(links);
   };
 
   const confirm = async () => {
@@ -143,7 +157,8 @@ export default function BillsPage() {
           </table>
         </div>
 
-        {role === "finance" && <AdjustmentPanel bill={openBill} adjustments={adjustments} onDone={load} onChange={setAdjustments} />}
+        {role === "finance" && <AdjustmentPanel bill={openBill} adjustments={adjustments}
+          adoptable={adoptable} onDone={load} onChange={setAdjustments} />}
         {adjustments.length > 0 && role !== "finance" && (
           <div className="panel">
             <h2>差额更正记录（原值保留，不替换）</h2>
@@ -196,13 +211,16 @@ export default function BillsPage() {
 function AdjustmentTable({ adjustments }: { adjustments: Adjustment[] }) {
   return (
     <table>
-      <thead><tr><th>成分</th><th className="num">原值</th><th className="num">更正值</th><th className="num">差额 delta</th><th>原因</th><th>登记人</th></tr></thead>
+      <thead><tr><th>成分</th><th className="num">原值</th><th className="num">更正值</th><th className="num">差额 delta</th>
+        <th>原因</th><th>引用采纳</th><th>登记人</th></tr></thead>
       <tbody>
         {adjustments.map((a) => (
           <tr key={a.id}>
             <td className="mono">{a.component}</td><td className="num">{a.original_value}</td>
             <td className="num">{a.corrected_value}</td><td className="num">{a.delta}</td>
-            <td>{a.reason}</td><td>{a.created_by}</td>
+            <td>{a.reason}</td>
+            <td className="mono muted">{a.adoption_id ? `采纳#${a.adoption_id}` : "—"}</td>
+            <td>{a.created_by}</td>
           </tr>
         ))}
       </tbody>
@@ -210,24 +228,29 @@ function AdjustmentTable({ adjustments }: { adjustments: Adjustment[] }) {
   );
 }
 
-function AdjustmentPanel({ bill, adjustments, onDone, onChange }: {
-  bill: Bill; adjustments: Adjustment[]; onDone: () => void;
-  onChange: (a: Adjustment[]) => void;
+function AdjustmentPanel({ bill, adjustments, adoptable, onDone, onChange }: {
+  bill: Bill; adjustments: Adjustment[];
+  adoptable: { adoption: Adoption; casePath: string }[];
+  onDone: () => void; onChange: (a: Adjustment[]) => void;
 }) {
   const [component, setComponent] = useState("unexplained_kwh");
   const [corrected, setCorrected] = useState("");
   const [reason, setReason] = useState("");
+  const [adoptionId, setAdoptionId] = useState("");
   const [err, setErr] = useState("");
   const canAdjust = bill.status === "confirmed" || bill.status === "adjusted";
+  const original = Number((bill as unknown as Record<string, string>)[component] ?? 0);
+  const reduces = corrected !== "" && Number(corrected) < original;
 
   const submit = async () => {
     setErr("");
     try {
       const { data } = await api.post<Adjustment>(`/api/bills/${bill.id}/adjustments`, {
         component, corrected_value: corrected, reason,
+        adoption_id: adoptionId === "" ? null : Number(adoptionId),
       });
       onChange([...adjustments, data]);
-      setCorrected(""); setReason(""); onDone();
+      setCorrected(""); setReason(""); setAdoptionId(""); onDone();
     } catch (e) { setErr(errText(e)); }
   };
 
@@ -243,9 +266,24 @@ function AdjustmentPanel({ bill, adjustments, onDone, onChange }: {
               .map((c) => <option key={c} value={c}>{c}</option>)}
           </select>
         </div>
-        <div><label>更正后值</label><input value={corrected} onChange={(e) => setCorrected(e.target.value)} disabled={!canAdjust} /></div>
+        <div><label>更正后值（原 {original}）</label><input value={corrected} onChange={(e) => setCorrected(e.target.value)} disabled={!canAdjust} /></div>
+        <div>
+          <label>引用财务采纳（减费必填）</label>
+          <select value={adoptionId} onChange={(e) => setAdoptionId(e.target.value)} disabled={!canAdjust}>
+            <option value="">不引用</option>
+            {adoptable.map(({ adoption, casePath }) => (
+              <option key={adoption.id} value={adoption.id}>
+                采纳#{adoption.id} {casePath}（{adoption.adopted_kwh} kWh）
+              </option>
+            ))}
+          </select>
+        </div>
         <div style={{ flex: 1, minWidth: 220 }}><label>依据/原因</label><input style={{ width: "100%" }} value={reason} onChange={(e) => setReason(e.target.value)} disabled={!canAdjust} /></div>
         <button onClick={submit} disabled={!canAdjust || !corrected || !reason}>登记更正</button>
+      </div>
+      <div className="muted" style={{ marginTop: 8 }}>
+        减少应付费用的更正必须引用财务已采纳的现场说明；未采纳说明不能直接减费。
+        {reduces && adoptionId === "" && <span className="danger-text"> 当前为减费但未引用采纳记录，后端会拒绝。</span>}
       </div>
       {err && <div className="error">{err}</div>}
       {adjustments.length > 0 && <div style={{ marginTop: 12 }}><AdjustmentTable adjustments={adjustments} /></div>}

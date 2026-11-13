@@ -343,11 +343,62 @@ def _apply_replacement(db: Session, site: models.Site, payload: dict, sr, rev):
     )
 
 
+def _apply_topology(db: Session, site: models.Site, payload: dict, sr, rev):
+    """登记一条有效连接关系；同号修订时先停用旧版，避免重叠挂接。"""
+    if rev.status != REV_APPLIED:
+        return
+    parent = _get_or_create_meter(db, site.id, payload["parent_meter_no"],
+                                  payload.get("parent_role", "branch").strip() or "branch",
+                                  payload.get("parent_device_id"))
+    child_role = payload.get("child_role", "device").strip() or "device"
+    child_device = payload.get("child_device_id") or payload.get("device_id")
+    child = _get_or_create_meter(db, site.id, payload["child_meter_no"], child_role, child_device)
+    if child_role == "branch":
+        # 支路表只承载支路电量，不直接对应充电设备
+        child.device_id = None
+    eff = parse_local_datetime(payload["effective_time"], site.timezone)
+    end = parse_local_datetime(payload["end_time"], site.timezone) if payload.get("end_time") else None
+    if end is not None and end <= eff:
+        raise ImportError_(f"连接关系 {payload.get('record_no')} 终止时间必须晚于生效时间")
+
+    # 同一子节点的旧关系按生效时间自动收口，保证任一时刻只有一条有效接线
+    previous = db.scalars(
+        select(models.TopologyEdge).where(
+            models.TopologyEdge.site_id == site.id,
+            models.TopologyEdge.child_meter_id == child.id,
+            models.TopologyEdge.status == models.TOPO_ACTIVE,
+            models.TopologyEdge.effective_ts < eff,
+        )
+    ).all()
+    for old in previous:
+        if old.end_ts is None or old.end_ts > eff:
+            old.end_ts = eff
+            old.end_ts_local = utc_to_local(eff, site.timezone)
+
+    # 同号修订：旧版本置 superseded（保留历史，便于解释历史差额）
+    _supersede(db, models.TopologyEdge, sr.id)
+    db.add(models.TopologyEdge(
+        site_id=site.id,
+        parent_meter_id=parent.id, child_meter_id=child.id,
+        parent_role=payload.get("parent_role", "branch"),
+        child_role=payload.get("child_role", "device"),
+        device_id=child.device_id or payload.get("child_device_id") or payload.get("device_id"),
+        effective_ts=eff, effective_ts_local=utc_to_local(eff, site.timezone),
+        end_ts=end, evidence_note=payload.get("evidence_note", ""),
+        status=models.TOPO_ACTIVE,
+        source_record_id=sr.id, revision_id=rev.id,
+    ))
+
+
 def apply_payload(db: Session, site: models.Site, source_type: str, payload: dict, sr, rev) -> None:
     if source_type == "master_reading":
         _apply_reading(db, site, payload, sr, rev, "master")
     elif source_type == "device_reading":
         _apply_reading(db, site, payload, sr, rev, "device")
+    elif source_type == "branch_reading":
+        _apply_reading(db, site, payload, sr, rev, "branch")
+    elif source_type == "topology":
+        _apply_topology(db, site, payload, sr, rev)
     elif source_type == "order":
         _apply_order(db, site, payload, sr, rev)
     elif source_type == "public_load":
@@ -394,6 +445,12 @@ SPECS = {
     },
     "device_reading": {
         "required": {"record_no", "meter_no", "reading_time", "reading_kwh"}
+    },
+    "branch_reading": {
+        "required": {"record_no", "meter_no", "reading_time", "reading_kwh"}
+    },
+    "topology": {
+        "required": {"record_no", "parent_meter_no", "child_meter_no", "effective_time"}
     },
     "order": {
         "required": {"record_no", "order_no", "device_id", "start_time", "end_time", "reported_energy"}

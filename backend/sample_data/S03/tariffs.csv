@@ -1,0 +1,6 @@
+record_no,tariff_name,effective_date,end_date,segment_name,start_hour,end_hour,price
+TAR-HZ-Q4,杭州四季度电价,2026-09-01,,valley,0,6,0.3300
+TAR-HZ-Q4,杭州四季度电价,2026-09-01,,peak,6,10,0.9800
+TAR-HZ-Q4,杭州四季度电价,2026-09-01,,flat,10,18,0.6800
+TAR-HZ-Q4,杭州四季度电价,2026-09-01,,peak,18,22,0.9800
+TAR-HZ-Q4,杭州四季度电价,2026-09-01,,valley,22,24,0.3300

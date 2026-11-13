@@ -118,6 +118,137 @@ export interface Adjustment {
   corrected_value: string;
   delta: string;
   reason: string;
+  case_id: number | null;
+  residual_id: number | null;
+  adoption_id: number | null;
   created_by: string;
   created_at: string;
+}
+
+export interface TopologyEdge {
+  id: number;
+  site_id: number;
+  parent_meter_no: string;
+  child_meter_no: string;
+  parent_role: string;
+  child_role: string;
+  device_id: string | null;
+  effective_ts_local: string;
+  end_ts_local: string | null;
+  evidence_note: string;
+  status: string;
+}
+
+export interface TopologyIssue {
+  id: number;
+  site_id: number;
+  issue_kind: string;
+  subject: string;
+  detail: string;
+  detected_at_local: string;
+  status: string;
+}
+
+export interface Residual {
+  id: number;
+  job_id: number;
+  site_id: number;
+  parent_meter_no: string;
+  parent_role: string;
+  subject: string;
+  start_ts_local: string;
+  end_ts_local: string;
+  parent_kwh: string | null;
+  known_children_kwh: string;
+  residual_kwh: string | null;
+  residual_pct: string | null;
+  order_gap_kwh: string;
+  uncovered_kwh: string;
+  residual_kind: string;
+  has_order_gap: boolean;
+  has_reading_gap: boolean;
+  suspect: boolean;
+  continues_previous: boolean;
+  case_id: number | null;
+  note: string | null;
+}
+
+export interface OrderGap {
+  id: number;
+  job_id: number;
+  site_id: number;
+  device_id: string | null;
+  start_ts_local: string;
+  end_ts_local: string;
+  gap_kind: string;
+  missing_kwh: string | null;
+  covered_seconds: number;
+  total_seconds: number;
+  note: string | null;
+}
+
+export interface ResidualSummary {
+  id: number;
+  job_id: number;
+  site_id: number;
+  status: string;
+  master_total_kwh: string;
+  known_children_kwh: string;
+  branch_residual_kwh: string;
+  uncovered_kwh: string;
+  top_residual_kwh: string;
+  order_gap_kwh: string;
+  gap_windows: string | null;
+  concentrated_branches: string | null;
+  conclusion: string;
+  blocked_reason: string | null;
+  copied_from_job_id: number | null;
+}
+
+export interface FieldCase {
+  id: number;
+  site_id: number;
+  job_id: number;
+  residual_id: number | null;
+  meter_no: string | null;
+  device_id: string | null;
+  branch_path: string;
+  start_ts_local: string;
+  end_ts_local: string;
+  residual_kwh: string | null;
+  reason: string;
+  status: string;
+  assignee: string;
+  handling_note: string | null;
+  handled_by: string | null;
+  handled_at: string | null;
+  superseded_by_job_id: number | null;
+  superseded_reason: string | null;
+}
+
+export interface CaseEvidence {
+  id: number;
+  case_id: number;
+  site_id: number;
+  evidence_kind: string;
+  claim_kwh: string | null;
+  description: string;
+  attachment_ref: string | null;
+  submitted_by: string;
+  submitted_at: string;
+  would_reduce_payable: boolean;
+}
+
+export interface Adoption {
+  id: number;
+  case_id: number;
+  evidence_id: number;
+  site_id: number;
+  bill_id: number | null;
+  decision: string;
+  adopted_kwh: string | null;
+  allowed_to_reduce_payable: boolean;
+  reason: string;
+  decided_by: string | null;
+  decided_at: string | null;
 }

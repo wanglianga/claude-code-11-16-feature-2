@@ -1,0 +1,9 @@
+record_no,parent_meter_no,child_meter_no,parent_role,child_role,device_id,effective_time,end_time,evidence_note
+TOPO-HZ-01,M-HZ-01,BR-1,master,branch,,2026-10-01 00:00,,总表至 1 号配电支路
+TOPO-HZ-02,M-HZ-01,BR-2,master,branch,,2026-10-01 00:00,,总表至 2 号配电支路
+TOPO-HZ-03,M-HZ-01,BR-3,master,branch,,2026-10-01 00:00,,总表至 3 号配电支路
+TOPO-HZ-04,BR-1,M-H1,branch,device,DEV-H1,2026-10-01 00:00,,1 号支路挂 DEV-H1
+TOPO-HZ-05,BR-1,M-H2,branch,device,DEV-H2,2026-10-01 00:00,,1 号支路挂 DEV-H2
+TOPO-HZ-06,BR-2,M-H3,branch,device,DEV-H3,2026-10-01 00:00,,2 号支路挂 DEV-H3
+TOPO-HZ-07,BR-3,M-H4,branch,device,DEV-H4,2026-10-01 00:00,,3 号支路挂 DEV-H4
+TOPO-HZ-08,BR-2,M-H2,branch,device,DEV-H2,2026-10-15 00:00,,现场改线 WO-HZ-20261014-02：DEV-H2 从 1 号支路改接 2 号支路，自 10-15 起生效

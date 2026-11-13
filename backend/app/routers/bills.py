@@ -77,7 +77,10 @@ def create_adjustment(bill_id: int, body: schemas.AdjustmentIn,
                       db: Session = Depends(get_db),
                       user: models.User = Depends(require_roles(models.ROLE_FINANCE))):
     bill = _load_bill(db, bill_id, user)
-    adj = add_adjustment(db, bill, body.component, body.corrected_value, body.reason, user)
+    adj = add_adjustment(
+        db, bill, body.component, body.corrected_value, body.reason, user,
+        adoption_id=body.adoption_id,
+    )
     db.commit()
     db.refresh(adj)
     return adj

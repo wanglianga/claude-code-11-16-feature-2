@@ -1,9 +1,12 @@
-"""生成两个站点的样例计量文件（CSV），覆盖全部核算规则场景。
+"""生成三个站点的样例计量文件（CSV），覆盖全部核算规则场景。
 
 站点 S01 上海（Asia/Shanghai，UTC+8）：正常核对、跨时段实测/估算拆分、断网补报修订、
 公共照明（已确认）、未解释差额在阈值内可确认。
 站点 S02 乌鲁木齐（Asia/Urumqi，UTC+6）：设备更换桥接、读数回退无依据挂起、
 重复订单、时段冲突、待补订单、未确认公共负荷、未解释差额超阈值挂起。
+站点 S03 杭州临平（Asia/Shanghai，UTC+8）：总表-支路-设备三级连接、期中现场改线、
+支路 BR-3 持续偏离（进现场复核）、单一时窗 DEV-H3 缺订单（先追数据）、
+未挂接设备与已确认公共负荷单列（不摊给支路）。
 """
 from pathlib import Path
 
@@ -27,6 +30,10 @@ REPL_HEADER = (
 )
 TARIFF_HEADER = (
     "record_no,tariff_name,effective_date,end_date,segment_name,start_hour,end_hour,price"
+)
+TOPOLOGY_HEADER = (
+    "record_no,parent_meter_no,child_meter_no,parent_role,child_role,"
+    "device_id,effective_time,end_time,evidence_note"
 )
 
 
@@ -154,4 +161,119 @@ def gen_urumqi():
 if __name__ == "__main__":
     gen_shanghai()
     gen_urumqi()
+    print(f"样例文件已生成于 {BASE}")
+
+
+def gen_hangzhou():
+    """S03：拓扑定位样例。总表 7872 kWh，BR-3 每窗残差 90~100 kWh 持续同向；
+    DEV-H3 仅第 2 周缺订单（先追数据）；DEV-H5 未挂接、公共负荷已确认但未挂接，单列。"""
+    d = BASE / "S03"
+    weeks = [
+        ("2026-10-01 00:00", "2026-10-08 00:00"),
+        ("2026-10-08 00:00", "2026-10-15 00:00"),
+        ("2026-10-15 00:00", "2026-10-22 00:00"),
+        ("2026-10-22 00:00", "2026-11-01 00:00"),
+    ]
+    # 总表按周 1984/1984/1984/1920：恰好等于已挂接支路 + 未挂接设备 + 已确认公共负荷
+    master = [0, 1984, 3968, 5952, 7872]
+    # 支路累计读数：BR-1 第 3 周起 DEV-H2 改挂 BR-2，电量由 600/周降为 300/周
+    br1 = [0, 600, 1200, 1500, 1800]
+    br2 = [0, 500, 1000, 1800, 2600]
+    br3 = [0, 700, 1400, 2100, 2800]
+    dev1 = [0, 300, 600, 900, 1200]
+    dev2 = [0, 300, 600, 900, 1200]
+    dev3 = [0, 500, 1000, 1500, 2000]
+    dev4 = [0, 600, 1210, 1815, 2415]
+    # DEV-H5 未挂接到任何支路（计量盲区），只覆盖前 3 周，单列不摊给支路
+    dev5 = [0, 100, 200, 300]
+
+    points = ["2026-10-01 00:00", "2026-10-08 00:00", "2026-10-15 00:00",
+              "2026-10-22 00:00", "2026-11-01 00:00"]
+
+    def reading_rows(prefix, meter_no, device_id, values, kind_flag=""):
+        rows = []
+        for i, (ts, v) in enumerate(zip(points, values)):
+            rows.append(
+                f"{prefix}-{i + 1},{meter_no},{device_id},{ts},{v},false"
+            )
+        return rows
+
+    write(d / "master_readings.csv", READING_HEADER,
+          reading_rows("MR-HZ", "M-HZ-01", "", master))
+    branch_rows = []
+    for no, values in (("BR-1", br1), ("BR-2", br2), ("BR-3", br3)):
+        branch_rows += reading_rows(f"BRR-HZ-{no}", no, "", values)
+    write(d / "branch_readings.csv", READING_HEADER, branch_rows)
+
+    device_rows = []
+    for no, dev, values in (
+        ("M-H1", "DEV-H1", dev1), ("M-H2", "DEV-H2", dev2),
+        ("M-H3", "DEV-H3", dev3), ("M-H4", "DEV-H4", dev4),
+    ):
+        device_rows += reading_rows(f"DR-HZ-{no}", no, dev, values)
+    for i, v in enumerate(dev5):
+        device_rows.append(f"DR-HZ-M-H5-{i + 1},M-H5,DEV-H5,{points[i]},{v},false")
+    write(d / "device_readings.csv", READING_HEADER, device_rows)
+
+    write(d / "topology.csv", TOPOLOGY_HEADER, [
+        "TOPO-HZ-01,M-HZ-01,BR-1,master,branch,,2026-10-01 00:00,,总表至 1 号配电支路",
+        "TOPO-HZ-02,M-HZ-01,BR-2,master,branch,,2026-10-01 00:00,,总表至 2 号配电支路",
+        "TOPO-HZ-03,M-HZ-01,BR-3,master,branch,,2026-10-01 00:00,,总表至 3 号配电支路",
+        "TOPO-HZ-04,BR-1,M-H1,branch,device,DEV-H1,2026-10-01 00:00,,1 号支路挂 DEV-H1",
+        "TOPO-HZ-05,BR-1,M-H2,branch,device,DEV-H2,2026-10-01 00:00,,1 号支路挂 DEV-H2",
+        "TOPO-HZ-06,BR-2,M-H3,branch,device,DEV-H3,2026-10-01 00:00,,2 号支路挂 DEV-H3",
+        "TOPO-HZ-07,BR-3,M-H4,branch,device,DEV-H4,2026-10-01 00:00,,3 号支路挂 DEV-H4",
+        # 期中现场改线：DEV-H2 由 BR-1 改挂 BR-2，按生效时间分段，历史差额按当时接线解释
+        "TOPO-HZ-08,BR-2,M-H2,branch,device,DEV-H2,2026-10-15 00:00,,"
+        "现场改线 WO-HZ-20261014-02：DEV-H2 从 1 号支路改接 2 号支路，自 10-15 起生效",
+    ])
+
+    # 订单：按周覆盖；DEV-H3 第 2 周（10-08~10-15）漏报，形成“单一时窗缺订单”
+    order_rows = []
+
+    def order(rec, no, dev, start_reading, end_reading, start, end, energy):
+        order_rows.append(
+            f"{rec},{no},{dev},{start},{end},{start_reading},{end_reading},{energy}"
+        )
+
+    for i, (start, end) in enumerate(weeks):
+        order(f"OR-HZ-H1-{i + 1}", f"O-H1-{i + 1}", "DEV-H1",
+              dev1[i], dev1[i + 1], start, end, dev1[i + 1] - dev1[i])
+        order(f"OR-HZ-H2-{i + 1}", f"O-H2-{i + 1}", "DEV-H2",
+              dev2[i], dev2[i + 1], start, end, dev2[i + 1] - dev2[i])
+        order(f"OR-HZ-H4-{i + 1}", f"O-H4-{i + 1}", "DEV-H4",
+              dev4[i], dev4[i + 1], start, end, dev4[i + 1] - dev4[i])
+        if i < len(dev5) - 1:  # DEV-H5 只前 3 周有订单
+            order(f"OR-HZ-H5-{i + 1}", f"O-H5-{i + 1}", "DEV-H5",
+                  dev5[i], dev5[i + 1], start, end, dev5[i + 1] - dev5[i])
+        if i == 1:
+            continue  # 第 2 周 DEV-H3 缺订单，只追数据，不据此定性故障
+        order(f"OR-HZ-H3-{i + 1}", f"O-H3-{i + 1}", "DEV-H3",
+              dev3[i], dev3[i + 1], start, end, dev3[i + 1] - dev3[i])
+    write(d / "orders.csv", ORDER_HEADER, order_rows)
+
+    # 已确认公共负荷（未挂接到任何支路，必须单列）；未确认的生成物业核对事项
+    write(d / "public_loads.csv", PUBLIC_HEADER, [
+        "PL-HZ-001,站区安防与污水处理公共负荷,2026-10-01 00:00,2026-11-01 00:00,372,true",
+        "PL-HZ-002,北侧临时照明,2026-10-01 00:00,2026-11-01 00:00,60,false",
+    ])
+
+    # 复核期间补报的缺订单时段（导入并重算后，旧现场工单应转 superseded）
+    write(d / "orders_v2_backfill.csv", ORDER_HEADER, [
+        "OR-HZ-H3-2,O-H3-2,DEV-H3,2026-10-08 00:00,2026-10-15 00:00,500,1000,500",
+    ])
+
+    write(d / "tariffs.csv", TARIFF_HEADER, [
+        "TAR-HZ-Q4,杭州四季度电价,2026-09-01,,valley,0,6,0.3300",
+        "TAR-HZ-Q4,杭州四季度电价,2026-09-01,,peak,6,10,0.9800",
+        "TAR-HZ-Q4,杭州四季度电价,2026-09-01,,flat,10,18,0.6800",
+        "TAR-HZ-Q4,杭州四季度电价,2026-09-01,,peak,18,22,0.9800",
+        "TAR-HZ-Q4,杭州四季度电价,2026-09-01,,valley,22,24,0.3300",
+    ])
+
+
+if __name__ == "__main__":
+    gen_shanghai()
+    gen_urumqi()
+    gen_hangzhou()
     print(f"样例文件已生成于 {BASE}")

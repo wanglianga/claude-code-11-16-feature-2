@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     energy_scale: int = 4
     # 未解释差额超出该比例（相对总表电量）时账单暂停确认
     default_diff_threshold_pct: str = "0.02"
+    # 支路残差占上级电量超过该比例才算“偏离”，且需连续时窗同向才进入现场复核
+    residual_tolerance_pct: str = "0.02"
 
 
 @lru_cache
